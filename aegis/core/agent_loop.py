@@ -5,11 +5,15 @@ It implements the Reason+Act (ReAct) pattern with pluggable tools,
 safety gates, and memory.
 """
 
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 from pydantic import BaseModel
+
+# Initialize structured logger
+logger = logging.getLogger(__name__)
 
 
 class AgentState(str, Enum):
@@ -53,7 +57,7 @@ class AgentLoop:
         llm_client: Any,
         tools: dict[str, Callable],
         max_steps: int = 10,
-        safety_gate: Optional[Callable] = None,
+        safety_gate: Optional[Callable[[ToolCall], Tuple[bool, str]]] = None,
     ):
         self.llm_client = llm_client
         self.tools = tools
@@ -87,7 +91,6 @@ class AgentLoop:
         if "Action:" in text:
             action_part = text.split("Action:", 1)[1].strip()
             
-            # Find the first '(' and matching last ')'
             if "(" in action_part and ")" in action_part:
                 tool_name = action_part.split("(", 1)[0].strip()
                 args_str = action_part.split("(", 1)[1].rsplit(")", 1)[0].strip()
@@ -99,7 +102,6 @@ class AgentLoop:
                     is_final=False
                 )
 
-        # 4. Fallback for unparseable input
         return StepResult(thought=text, tool_call=None, is_final=False)
 
     def _parse_key_value_args(self, args_str: str) -> dict[str, Any]:
@@ -108,6 +110,8 @@ class AgentLoop:
         if not args_str.strip():
             return args
 
+        # NOTE: Key-value string parsing is best-effort. Complex nested structures
+        # should strictly use JSON formatting schemas in down-stream tasks.
         args_str = args_str.replace("\n", " ")
         
         pairs = []
@@ -154,11 +158,60 @@ class AgentLoop:
         return value
 
     def execute_tool(self, tool_call: ToolCall) -> str:
-        """Execute a tool call and return the observation."""
-        # Temporary mock implementation to support future testing
-        pass
+        """Execute a tool call safely with validation check gates."""
+        logger.debug(f"Intercepting execution request for tool: {tool_call.name}")
+        
+        # 1. Advanced Evaluation Safety Check
+        if self.safety_gate:
+            allowed, reason = self.safety_gate(tool_call)
+            if not allowed:
+                logger.warning(f"Safety Gate Intervention! Denied execution of '{tool_call.name}'. Reason: {reason}")
+                return f"Action blocked: {reason}. Please try an alternative approach."
+
+        # 2. Scope verification
+        if tool_call.name not in self.tools:
+            logger.error(f"Execution Target Misalignment: Unknown tool '{tool_call.name}' called.")
+            return f"Error: Unknown tool '{tool_call.name}' requested."
+
+        # 3. Dynamic payload execution
+        try:
+            result = self.tools[tool_call.name](**tool_call.arguments)
+            return str(result)
+        except Exception as e:
+            logger.error(f"Runtime Exception in tool '{tool_call.name}': {str(e)}")
+            return f"Error executing tool '{tool_call.name}': {str(e)}"
 
     def run(self, task: str) -> str:
-        """Execute the full agent loop for a given task."""
-        # Temporary mock implementation to support future testing
-        pass
+        """Execute the full agent orchestration execution loop."""
+        logger.info(f"Starting execution run lifecycle for task payload: {task[:100]}")
+        self.add_message("user", task)
+        
+        for step in range(self.max_steps):
+            logger.info(f"Orchestrating Step {step + 1}/{self.max_steps}")
+            self.state = AgentState.THINKING
+            
+            # Fetch response generation from client engine
+            raw_response = self.llm_client.generate(self.history)
+            result = self.parse_response(raw_response)
+            
+            # Record state trajectory history
+            self.add_message("assistant", raw_response)
+            
+            if result.is_final:
+                logger.info(f"Terminal node reached successfully. Task completed.")
+                self.state = AgentState.COMPLETED
+                return result.thought
+                
+            if result.tool_call:
+                self.state = AgentState.ACTING
+                observation = self.execute_tool(result.tool_call)
+                logger.debug(f"Tool Observation captured: {observation[:100]}")
+                self.add_message("tool", observation)
+            else:
+                # Loop recovery sequence for formatting friction
+                logger.warning("Agent encountered loop parsing friction. Prompting corrective recovery.")
+                self.add_message("system", "Format error: Please supply an Action or a Final Answer block.")
+
+        logger.error("System Failure: Orchestration termination criteria breached via step ceiling bounds.")
+        self.state = AgentState.FAILED
+        return "Max steps reached without resolution."
